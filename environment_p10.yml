@@ -1,0 +1,7 @@
+name: serial-traffic-generator-p10
+channels:
+  - conda-forge
+  - defaults
+dependencies:
+  - python=3.10
+  - pyserial
