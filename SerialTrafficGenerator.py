@@ -526,13 +526,26 @@ class SerialThroughput:
                 self.result_box.insert(END, "Error running test. Check serial port and TCP connection.\n%s\n" % str(e))
                 self.cancel_test()
 
-    def flow_control_tx_start(self, port):
+    def flow_control_tx_start(self, port: serial.Serial):
         # When flow control is enabled, we set the RTS signal (to key up external radio, RS485 device etc)
         # and then wait for CTS signal to confirm that device under test is ready to transmit
         if self.use_flow_control:
             flow_control_start = time.clock()
             port.setRTS(True)
-            while port.getCTS() == False:
+
+            # ┌──────────────────────────┬────────┬────────────────┐
+            # │          Method          │  Pin   │  Description   │
+            # ├──────────────────────────┼────────┼────────────────┤
+            # │ port.getCTS() / port.cts │ CTS    │ Clear To Send  │
+            # ├──────────────────────────┼────────┼────────────────┤
+            # │ port.getDSR() / port.dsr │ DSR    │ Data Set Ready │
+            # ├──────────────────────────┼────────┼────────────────┤
+            # │ port.getCD() / port.cd   │ CD / DCD │ Carrier Detect │
+            # ├──────────────────────────┼────────┼────────────────┤
+            # │ port.getRI() / port.ri   │ RI     │ Ring Indicator │
+            # └──────────────────────────┴────────┴────────────────┘
+
+            while port.getCTS():
                 if time.clock() - flow_control_start > 10:
                     raise Exception('Timeout waiting for flow control')
 
