@@ -226,7 +226,7 @@ class SerialThroughput:
         currentrow += 1
 
         self.hw_flow_control = IntVar()
-        self.hw_flow_control.set(0)
+        self.hw_flow_control.set(1)
         if confsection:
             val = confsection.get('hw_flow_control', 'False')
             if val == 'True':
