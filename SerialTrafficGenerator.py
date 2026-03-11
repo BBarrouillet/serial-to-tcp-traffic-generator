@@ -793,7 +793,8 @@ class SerialThroughput:
 
                 # Extract packet and parse header
                 sig, pkt_id = struct.unpack_from(HEADER_FORMAT, buffer, 0)
-                print("Received packet " + str(pkt_id) + " " + str(sig), " ", stream_pos)
+                if pkt_id % 100 == 0:
+                    print("Received packet " + str(pkt_id) + " " + str(sig), " ", stream_pos)
                 if sig == HEADER_SIGNATURE:
                     self.rx_packet_ok_count += 1
                     # Verify payload matches what was sent

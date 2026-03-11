@@ -482,6 +482,7 @@ class SerialThroughput:
             self.latencies = []
             self.received_ok_ids = set()
             self.received_corrupted_ids = set()
+
             self.rx_packet_sizes = []
 
             self.result_box.delete("1.0", END)
@@ -505,6 +506,22 @@ class SerialThroughput:
                 self.tcp_socket = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
                 self.tcp_socket.settimeout(timeout / 1000.0)
                 self.tcp_socket.connect((tcp_host, int(tcp_port)))
+
+                # Flush any stale data from a previous session
+                self.tcp_socket.setblocking(False)
+                try:
+                    while self.tcp_socket.recv(4096):
+                        pass
+                except BlockingIOError:
+                    pass
+                self.tcp_socket.setblocking(True)
+                self.tcp_socket.settimeout(timeout / 1000.0)
+
+                # Build the random payload once (header will be updated per packet)
+                payload_packet = bytearray(self.packet_size)
+                for x in range(HEADER_SIZE, self.packet_size):
+                    payload_packet[x] = random.randint(0, 255)
+                self.tx_payload = bytes(payload_packet[HEADER_SIZE:])
 
                 # Create threads for sending and receiving
                 if mode == "Throughput":
@@ -700,11 +717,8 @@ class SerialThroughput:
     def send_data_thread(self, send_port):
         tx_delay_seconds = self.calc_packet_tx_delay(self.packet_size)
 
-        # Build the random payload once (header will be updated per packet)
-        packet = bytearray(self.packet_size)
-        for x in range(HEADER_SIZE, self.packet_size):
-            packet[x] = random.randint(0, 255)
-        self.tx_payload = bytes(packet[HEADER_SIZE:])
+        # Use the payload generated before threads were started
+        packet = bytearray(HEADER_SIZE) + bytearray(self.tx_payload)
 
         # For fixed bandwidth mode, calculate the target interval between packet sends
         if self.sending_mode == "Fixed Bandwidth" and self.target_bw > 0:
@@ -793,7 +807,8 @@ class SerialThroughput:
 
                 # Extract packet and parse header
                 sig, pkt_id = struct.unpack_from(HEADER_FORMAT, buffer, 0)
-                print("Received packet " + str(pkt_id) + " " + str(sig), " ", stream_pos)
+                if pkt_id % 100 == 0:
+                    print("Received packet " + str(pkt_id) + " " + str(sig), " ", stream_pos)
                 if sig == HEADER_SIGNATURE:
                     self.rx_packet_ok_count += 1
                     # Verify payload matches what was sent
@@ -874,11 +889,14 @@ class SerialThroughput:
                 charsps = self.rx_byte_count / elapsed_time
 
                 # When calculating the bits per second for RS232, the start, stop and parity bits must be counted as well as the actual data bits
-                bitsps = self.rx_byte_count * (1 + self.data_bits + self.parity + self.stop_bits) / elapsed_time
+                bpc = 1 + self.data_bits + self.parity + self.stop_bits
+                bitsps = self.rx_byte_count * bpc / elapsed_time
+                good_bitsps = len(self.received_ok_ids) * self.packet_size * bpc / elapsed_time
             else:
                 packetsps = 0
                 charsps = 0
                 bitsps = 0
+                good_bitsps = 0
 
             self.result_box.insert(INSERT, "Tx Characters        : %s (%.1f %%)\n" % (
             self.tx_packet_count * self.packet_size, (self.tx_packet_count / self.packet_count * 100)))
@@ -891,7 +909,8 @@ class SerialThroughput:
             self.result_box.insert(INSERT, "Run Time             : {:.3f}\n\n".format(elapsed_time))
             self.result_box.insert(INSERT, "Packets/s            : {:.3f}\n".format(packetsps))
             self.result_box.insert(INSERT, "Char/s               : {:.3f}\n".format(charsps))
-            self.result_box.insert(INSERT, "Bits/s               : {:.3f}\n\n".format(bitsps))
+            self.result_box.insert(INSERT, "Bits/s               : {:.3f}\n".format(bitsps))
+            self.result_box.insert(INSERT, "Good Bits/s          : {:.3f}\n\n".format(good_bitsps))
 
             all_received = self.received_ok_ids | self.received_corrupted_ids
             self.result_box.insert(INSERT, "Packet Tracking:\n")
