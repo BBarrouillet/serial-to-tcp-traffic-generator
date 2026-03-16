@@ -505,10 +505,15 @@ class SerialThroughput:
                 # of half duplex devices and we want to ensure that sender is in receive/tx idle state at start
                 sender.setRTS(False)
 
+                # Store TCP connection parameters for reconnection
+                self.tcp_host = tcp_host
+                self.tcp_port = int(tcp_port)
+                self.tcp_timeout = timeout / 1000.0
+
                 # Connect to the TCP receiver (reelwell system)
                 self.tcp_socket = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
-                self.tcp_socket.settimeout(timeout / 1000.0)
-                self.tcp_socket.connect((tcp_host, int(tcp_port)))
+                self.tcp_socket.settimeout(self.tcp_timeout)
+                self.tcp_socket.connect((self.tcp_host, self.tcp_port))
 
                 # Flush any stale data from a previous session
                 self.tcp_socket.setblocking(False)
@@ -518,7 +523,7 @@ class SerialThroughput:
                 except BlockingIOError:
                     pass
                 self.tcp_socket.setblocking(True)
-                self.tcp_socket.settimeout(timeout / 1000.0)
+                self.tcp_socket.settimeout(self.tcp_timeout)
 
                 # Build the random payload once (header will be updated per packet)
                 payload_packet = bytearray(self.packet_size)
@@ -610,6 +615,37 @@ class SerialThroughput:
                 break
         return bytes(data)
 
+    def tcp_reconnect(self, retry_delay=2):
+        """Attempt to reconnect the TCP socket indefinitely until success or test is stopped."""
+        attempt = 0
+        while not self.stop_threads:
+            attempt += 1
+            print("TCP reconnect attempt %d..." % attempt)
+            try:
+                if self.tcp_socket:
+                    try:
+                        self.tcp_socket.close()
+                    except:
+                        pass
+                self.tcp_socket = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
+                self.tcp_socket.settimeout(self.tcp_timeout)
+                self.tcp_socket.connect((self.tcp_host, self.tcp_port))
+                # Flush any stale data
+                self.tcp_socket.setblocking(False)
+                try:
+                    while self.tcp_socket.recv(4096):
+                        pass
+                except BlockingIOError:
+                    pass
+                self.tcp_socket.setblocking(True)
+                self.tcp_socket.settimeout(self.tcp_timeout)
+                print("TCP reconnected successfully.")
+                return self.tcp_socket
+            except Exception as e:
+                print("TCP reconnect attempt %d failed: %s" % (attempt, str(e)))
+                time.sleep(retry_delay)
+        return None
+
     def resolve_pkt_id(self, wire_id):
         """Convert a wire pkt_id (which wraps at PKT_ID_WRAP) back to a logical sequential ID."""
         if wire_id >= 59000:
@@ -645,32 +681,49 @@ class SerialThroughput:
 
                 self.flow_control_tx_finish(send_port, tx_delay_seconds)
 
-                data = self.tcp_recv(receive_socket, self.packet_size)
+                try:
+                    data = self.tcp_recv(receive_socket, self.packet_size)
+                except socket.timeout:
+                    # No data yet, just keep waiting
+                    continue
+                except Exception as e:
+                    # Connection lost, try to reconnect
+                    print("TCP connection error in latency thread: %s" % str(e))
+                    receive_socket = self.tcp_reconnect()
+                    if receive_socket is None:
+                        break
+                    continue
 
-                if len(data) > 0:
-                    self.rx_byte_count += len(data)
-                    self.rx_packet_count += 1
+                if len(data) == 0:
+                    # Connection closed, try to reconnect
+                    print("TCP connection closed in latency thread.")
+                    receive_socket = self.tcp_reconnect()
+                    if receive_socket is None:
+                        break
+                    continue
 
-                    if data == packet:
-                        self.rx_packet_ok_count += 1
+                self.rx_byte_count += len(data)
+                self.rx_packet_count += 1
 
-                    # Track received packet ID and verify payload
-                    if len(data) >= HEADER_SIZE:
-                        sig, pkt_id = struct.unpack_from(HEADER_FORMAT, data, 0)
-                        if sig == HEADER_SIGNATURE:
-                            logical_id = self.resolve_pkt_id(pkt_id)
-                            if data[HEADER_SIZE:] == self.tx_payload:
-                                self.received_ok_ids.add(logical_id)
-                            else:
-                                self.received_corrupted_ids.add(logical_id)
+                if data == packet:
+                    self.rx_packet_ok_count += 1
+
+                # Track received packet ID and verify payload
+                if len(data) >= HEADER_SIZE:
+                    sig, pkt_id = struct.unpack_from(HEADER_FORMAT, data, 0)
+                    if sig == HEADER_SIGNATURE:
+                        logical_id = self.resolve_pkt_id(pkt_id)
+                        if data[HEADER_SIZE:] == self.tx_payload:
+                            self.received_ok_ids.add(logical_id)
                         else:
-                            self.rx_bad_signature_count += 1
+                            self.received_corrupted_ids.add(logical_id)
+                    else:
+                        self.rx_bad_signature_count += 1
 
-                    latency = time.perf_counter() - start
-                    self.latencies.append(latency)
-        except:
-            # This is usually because of a timeout. Just exit the sending thread
-            pass
+                latency = time.perf_counter() - start
+                self.latencies.append(latency)
+        except Exception as e:
+            print("Latency thread error: %s" % str(e))
 
     def poll_response_thread(self, polling_port, responder_port):
         tx_delay_seconds = self.calc_packet_tx_delay(self.packet_size)
@@ -790,11 +843,23 @@ class SerialThroughput:
             try:
                 chunk = receive_socket.recv(4096)
                 if len(chunk) == 0:
-                    break
+                    # Connection closed, try to reconnect
+                    print("TCP connection closed by remote end.")
+                    receive_socket = self.tcp_reconnect()
+                    if receive_socket is None:
+                        break
+                    continue
                 buffer.extend(chunk)
                 self.rx_byte_count += len(chunk)
             except socket.timeout:
-                break
+                # No data yet, just keep waiting
+                continue
+            except (ConnectionResetError, ConnectionAbortedError, OSError) as e:
+                print("TCP connection error: %s" % str(e))
+                receive_socket = self.tcp_reconnect()
+                if receive_socket is None:
+                    break
+                continue
 
             # Process complete packets from buffer
             while len(buffer) >= self.packet_size and packets_parsed < self.packet_count:
