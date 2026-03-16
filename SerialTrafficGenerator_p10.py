@@ -25,6 +25,7 @@ from tkinter import messagebox
 HEADER_SIGNATURE = 0xBEEF
 HEADER_FORMAT = '>HH'
 HEADER_SIZE = 4
+PKT_ID_WRAP = 60000
 
 
 class SerialThroughput:
@@ -482,6 +483,8 @@ class SerialThroughput:
             self.latencies = []
             self.received_ok_ids = set()
             self.received_corrupted_ids = set()
+            self.pkt_id_offset = 0
+            self.pkt_id_wrap_ready = False
 
             self.rx_packet_sizes = []
 
@@ -607,6 +610,15 @@ class SerialThroughput:
                 break
         return bytes(data)
 
+    def resolve_pkt_id(self, wire_id):
+        """Convert a wire pkt_id (which wraps at PKT_ID_WRAP) back to a logical sequential ID."""
+        if wire_id >= 59000:
+            self.pkt_id_wrap_ready = True
+        elif self.pkt_id_wrap_ready and wire_id < 1000:
+            self.pkt_id_offset += PKT_ID_WRAP
+            self.pkt_id_wrap_ready = False
+        return wire_id + self.pkt_id_offset
+
     def latency_thread(self, send_port, receive_socket):
         # Build the random payload once (header will be updated per packet)
         packet = bytearray(self.packet_size)
@@ -621,8 +633,8 @@ class SerialThroughput:
                 if self.stop_threads:
                     break
 
-                # Write header with signature and packet ID
-                struct.pack_into(HEADER_FORMAT, packet, 0, HEADER_SIGNATURE, x)
+                # Write header with signature and packet ID (wraps at PKT_ID_WRAP to fit in 16-bit unsigned)
+                struct.pack_into(HEADER_FORMAT, packet, 0, HEADER_SIGNATURE, x % PKT_ID_WRAP)
 
                 start = time.perf_counter()
 
@@ -646,10 +658,11 @@ class SerialThroughput:
                     if len(data) >= HEADER_SIZE:
                         sig, pkt_id = struct.unpack_from(HEADER_FORMAT, data, 0)
                         if sig == HEADER_SIGNATURE:
+                            logical_id = self.resolve_pkt_id(pkt_id)
                             if data[HEADER_SIZE:] == self.tx_payload:
-                                self.received_ok_ids.add(pkt_id)
+                                self.received_ok_ids.add(logical_id)
                             else:
-                                self.received_corrupted_ids.add(pkt_id)
+                                self.received_corrupted_ids.add(logical_id)
                         else:
                             self.rx_bad_signature_count += 1
 
@@ -732,8 +745,8 @@ class SerialThroughput:
         next_send_time = self.start_time
         try:
             for x in range(0, self.packet_count):
-                # Write header with signature and packet ID
-                struct.pack_into(HEADER_FORMAT, packet, 0, HEADER_SIGNATURE, x)
+                # Write header with signature and packet ID (wraps at PKT_ID_WRAP to fit in 16-bit unsigned)
+                struct.pack_into(HEADER_FORMAT, packet, 0, HEADER_SIGNATURE, x % PKT_ID_WRAP)
 
                 if target_interval:
                     # Fixed bandwidth: wait until it's time to send the next packet
@@ -807,15 +820,16 @@ class SerialThroughput:
 
                 # Extract packet and parse header
                 sig, pkt_id = struct.unpack_from(HEADER_FORMAT, buffer, 0)
-                if pkt_id % 100 == 0:
-                    print("Received packet " + str(pkt_id) + " " + str(sig), " ", stream_pos)
+                logical_id = self.resolve_pkt_id(pkt_id)
+                if logical_id % 100 == 0:
+                    print("Received packet " + str(logical_id) + " (wire=" + str(pkt_id) + ") " + str(sig), " ", stream_pos)
                 if sig == HEADER_SIGNATURE:
                     self.rx_packet_ok_count += 1
                     # Verify payload matches what was sent
                     if buffer[HEADER_SIZE:self.packet_size] == self.tx_payload:
-                        self.received_ok_ids.add(pkt_id)
+                        self.received_ok_ids.add(logical_id)
                     else:
-                        self.received_corrupted_ids.add(pkt_id)
+                        self.received_corrupted_ids.add(logical_id)
                 stream_pos += self.packet_size
                 buffer = buffer[self.packet_size:]
                 self.last_rx_time = time.perf_counter()
